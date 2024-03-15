@@ -3,7 +3,7 @@
 ;; Author: Diego Alvarez <c3po@diegoa.ca>
 ;; Keywords: c3po, chatgpt, openai
 ;; Package-Requires: ((emacs "27.1") (compat "29.1.0.0"))
-;; Version: 0.20231120
+;; Version: 0.202403
 ;;
 ;; This file is not part of GNU Emacs.
 ;;
@@ -19,6 +19,7 @@
 ;;
 ;;; Code:
 (require 'compat) ;; for emacs < 29, for keymap-local-set
+(require 'url-parse)
 
 (require 'diff)
 (require 'json)
@@ -31,7 +32,7 @@
 ;; It will be later redefined by url-http to avoid a warning during compilation.
 (defvar url-http-end-of-headers)
 
-(defvar c3po-api-key nil "The API key for the OpenAI API.")
+(defvar c3po-api-key nil "Deprecated: The API key for the OpenAI API.")
 
 (defvar c3po-buffer-name "*🤖C3PO🤖*" "The name of the C-3PO buffer.")
 
@@ -48,6 +49,17 @@
 (defvar c3po-default-pre-processors '(c3po-add-to-buffer-pre-processor) "List of default pre-processors applied to all droids.")
 
 (defvar c3po-default-post-processors '(c3po-add-to-buffer-post-processor) "List of default post-processors applied to all droids.")
+
+(defvar c3po-api-settings-legacy '(:api-url "https://api.openai.com/v1/chat/completions"
+                                   :api-key-source 'c3po-api-key-legacy)
+  "Use OpenAI endpoint with an API key from c3po-api-key.")
+
+(defvar c3po-api-settings-auth-source '(:api-url "https://api.openai.com/v1/chat/completions"
+                                        :api-key-source 'c3po-api-key-auth-source
+                                        :auth-source-user "apikey"
+                                        :auth-source-host "api.openai.com"))
+
+(defvar c3po-api-settings c3po-api-settings-legacy  "Default URL & api-key method.")
 
 (defvar c3po-droids-alist
   '(
@@ -137,25 +149,62 @@ It pass to the function the DROID, PROMPT, RESULT, and ARGS."
   (save-excursion
     (c3po-append-result (format "### 🤖 Answer\n%s\n" result))))
 
+;;
+;; API configuration handling
+
+(defun c3po-api-key--legacy (api-settings)
+  "Read the api key via legacy c3po-api-key."
+  c3po-api-key)
+
+(defun c3po-api-key--auth-source (api-settings)
+  "Read the api key via auth-source."
+  (interactive)
+
+  (let* ((user (plist-get api-settings :auth-source-user))
+         (host (plist-get api-settings :auth-source-host))
+         (result (auth-source-search :max 1
+                                     :user user
+                                     :host host
+                                     :require '(:secret)
+                                     :create nil))
+         (secret (plist-get (car result) :secret)))
+    (if (functionp secret)
+        (funcall secret)
+      secret)))
+
+(defun c3po-api-url--get (api-settings)
+  "Find the c3po API url."
+  (plist-get api-settings :api-url))
+
+(defun c3po-api-key--get (api-settings)
+  "Dispatch on the :api-key-source in API-SETTINGS to get the API key."
+  (let* ((fn (plist-get api-settings :api-key-source)))
+    (cond ((eq 'c3po-api-key-auth-source fn) (c3po-api-key--auth-source api-settings))
+          ((eq 'c3po-api-key-legacy fn) (c3po-api-key--legacy api-settings))
+          ((functionp fn) (funcall fn api-settings))
+          (t nil))))
+
+;; API request handling
+
 (defun c3po--request-openai-api (callback &rest args)
   "Send chat messages request to OpenAI API, get result via CALLBACK.
 Pass additional ARGS to the CALLBACK function."
   (interactive)
-  (if (not c3po-api-key)
-      (message "Please provide an OpenAI API key first.")
-    (let* ((api-key c3po-api-key)
-           (url "https://api.openai.com/v1/chat/completions")
-           (model c3po-model)
-           (temperature c3po-temperature)
-           (url-request-method "POST")
-           (url-request-extra-headers `(("Content-Type" . "application/json")
-                                        ("Authorization" . ,(encode-coding-string(format "Bearer %s" api-key) 'utf-8))))
-           (url-request-data (encode-coding-string
-                              (json-encode `(:model ,model :messages ,c3po-chat-conversation :temperature ,temperature ))
-                              'utf-8)))
-      (url-retrieve url
-                    #'c3po--extract-content-answer
-                    (list callback args)))))
+  (let* ((url (c3po-api-url--get c3po-api-settings))
+         (api-key (c3po-api-key--get c3po-api-settings)))
+    (if (not api-key)
+        (message "Please provide an OpenAI API key for %s first (see `c3po-api-settings')." url)
+      (let* ((model c3po-model)
+             (temperature c3po-temperature)
+             (url-request-method "POST")
+             (url-request-extra-headers `(("Content-Type" . "application/json")
+                                          ("Authorization" . ,(encode-coding-string(format "Bearer %s" api-key) 'utf-8))))
+             (url-request-data (encode-coding-string
+                                (json-encode `(:model ,model :messages ,c3po-chat-conversation :temperature ,temperature ))
+                                'utf-8)))
+        (url-retrieve url
+                      #'c3po--extract-content-answer
+                      (list callback args))))))
 
 (defun c3po--extract-content-answer (_status callback &rest args)
   "Extract the last lines of a JSON string from a buffer.
@@ -243,33 +292,11 @@ Check PROMPT to validate if needs to add back the new line."
         (insert result))
       (keyboard-escape-quit))))
 
-(defun c3po-send-conversation-and-replace-region (droid)
-  "Setup c3po to start a `c3po-send-conversation' with DROID.
-And result will be used by `c3po--callback-replace-region'."
-  (if (use-region-p)
-      (let ((beg (region-beginning))
-            (end (region-end)))
-        (c3po-send-conversation droid
-                                nil
-                                #'c3po--apply-post-processors-and-replace-region
-                                (buffer-name) ; here is where the additional args are passed
-                                beg
-                                end))
-    (message "No region selected or region is empty")))
-
-(defun c3po-show-diff-pre-processor (_droid _prompt)
-  "Empty the buffer `c3po-buffer-name'."
-  (with-current-buffer (get-buffer-create c3po-diff-buffer-name)
-    (setq buffer-read-only nil)
-    (erase-buffer)))
-
-(defun c3po-show-diff-post-processor (_droid prompt result &rest _args)
-  "Callback to show diff from PROMPT vs RESULT (tail of ARGS)."
-  ;; Adds back the final new line if the prompt had it.
-  (when (string-suffix-p "\n" prompt)
-    (setq result (concat result "\n")))
-  (c3po--diff-strings prompt result)
-  (c3po--pop-helper-buffer c3po-diff-buffer-name))
+;; Adds back the final new line if the prompt had it.
+(when (string-suffix-p "\n" prompt)
+  (setq result (concat result "\n")))
+(c3po--diff-strings prompt result)
+(c3po--pop-helper-buffer c3po-diff-buffer-name))
 
 (defmacro !c3po--make-chat (droid)
   "Macro to create functions chats for each DROID."
